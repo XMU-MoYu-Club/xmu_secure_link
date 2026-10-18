@@ -70,7 +70,13 @@ async fn main() -> Result<()> {
             msg = rx.recv() => match msg {
                 Some(ovpn3::Msg::Log(line)) => {
                     for physical in line.split('\n') {
-                        if let Some(cidr) = parse_app_route(physical) {
+                        // Both the ACL destinations and the pushed DNS servers must
+                        // be reachable through the tunnel: the resolver is pointed
+                        // at them, so a missing DNS route sends every lookup to the
+                        // default gateway (times out off-campus).
+                        if let Some(cidr) =
+                            parse_app_route(physical).or_else(|| parse_dns_server(physical))
+                        {
                             app_routes.push(cidr);
                         }
                     }
@@ -158,6 +164,28 @@ fn parse_app_route(line: &str) -> Option<String> {
     let (ip, _prefix) = cidr.split_once('/')?;
     if ip.split('.').count() == 4 && ip.split('.').all(|o| o.parse::<u8>().is_ok()) {
         Some(cidr.to_string())
+    } else {
+        None
+    }
+}
+
+/// Extract a pushed DNS server from a `dhcp-option DNS` log line, e.g.
+/// `0 [dhcp-option] [DNS] [210.34.0.18]` -> `210.34.0.18/32`.
+///
+/// SecureLink's DNS servers live inside the intranet, and OpenVPN3 points the
+/// OS resolver at them. The split-tunnel route set only covered the `app` ACL,
+/// so off-campus every lookup left through the default gateway and timed out.
+/// Returning them as /32 destinations gives them a tunnel route, and they are
+/// torn down together with the ACL routes on exit.
+fn parse_dns_server(line: &str) -> Option<String> {
+    if !line.contains("[dhcp-option]") {
+        return None;
+    }
+    let idx = line.find("[DNS]")?;
+    let rest = line[idx + "[DNS]".len()..].trim_start();
+    let ip = rest.strip_prefix('[')?.split(']').next()?.trim();
+    if ip.split('.').count() == 4 && ip.split('.').all(|o| o.parse::<u8>().is_ok()) {
+        Some(format!("{ip}/32"))
     } else {
         None
     }
@@ -456,4 +484,62 @@ fn is_elevated_windows() -> bool {
 unsafe extern "C" {
     #[link_name = "getuid"]
     fn libc_getuid() -> u32;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_dns_server_accepts_pushed_dns() {
+        assert_eq!(
+            parse_dns_server("0 [dhcp-option] [DNS] [210.34.0.18]").as_deref(),
+            Some("210.34.0.18/32")
+        );
+        assert_eq!(
+            parse_dns_server("1 [dhcp-option] [DNS] [210.34.0.14]").as_deref(),
+            Some("210.34.0.14/32")
+        );
+    }
+
+    #[test]
+    fn parse_dns_server_ignores_unrelated_lines() {
+        // ACL / topology / domain / ctrl lines must not be picked up here
+        assert_eq!(
+            parse_dns_server("129 [app] [[addr:121.192.180.236/32][proto:any] [port:21]]"),
+            None
+        );
+        assert_eq!(parse_dns_server("3 [topology] [subnet]"), None);
+        assert_eq!(parse_dns_server("0 [dhcp-option] [DOMAIN] [xmu.edu.cn]"), None);
+        assert_eq!(
+            parse_dns_server("183 [ctrl] [[domain:xk.xmu.edu.cn][sourceIp:219.229.81.200]]"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_dns_server_rejects_invalid_addresses() {
+        assert_eq!(parse_dns_server("0 [dhcp-option] [DNS] [abc.def]"), None);
+        assert_eq!(parse_dns_server("0 [dhcp-option] [DNS]"), None);
+        assert_eq!(parse_dns_server("0 [dhcp-option] [DNS] [1.2.3]"), None);
+        assert_eq!(parse_dns_server("0 [dhcp-option] [DNS] [999.1.1.1]"), None);
+        assert_eq!(parse_dns_server(""), None);
+    }
+
+    #[test]
+    fn parse_dns_server_accepts_public_resolver_known_tradeoff() {
+        // Documented trade-off: a public resolver is also routed through the
+        // tunnel. Current SecureLink only pushes intranet resolvers.
+        assert_eq!(
+            parse_dns_server("0 [dhcp-option] [DNS] [8.8.8.8]").as_deref(),
+            Some("8.8.8.8/32")
+        );
+    }
+
+    #[test]
+    fn acl_lines_still_go_through_parse_app_route() {
+        let acl = "129 [app] [[addr:121.192.180.236/32][proto:any] [port:21]]";
+        assert_eq!(parse_app_route(acl).as_deref(), Some("121.192.180.236/32"));
+        assert_eq!(parse_dns_server(acl), None);
+    }
 }
